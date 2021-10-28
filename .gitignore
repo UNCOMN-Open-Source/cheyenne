@@ -1,0 +1,6 @@
+.venv/
+*.code-workspace
+.vscode/
+config.json
+dist/
+temp/

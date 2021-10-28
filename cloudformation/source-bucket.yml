@@ -1,0 +1,160 @@
+#
+# source-bucket.yml
+#
+# Project Cheyenne
+#
+# @author Damian Bushong <dbushong@uncomn.com>
+# @copyright (c) 2021 UNCOMN LLC.
+# @license MIT License
+#
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates a new source bucket for use with the Cheyenne Vault.'
+
+Parameters:
+  IngestFunctionParameter:
+    Description: '(Required) The ARN of the Ingest Function (Lambda) within the vault.'
+    Type: 'String'
+    ConstraintDescription: 'Must be a valid AWS Lambda Function ARN.'
+    AllowedPattern: 'arn:aws(?:-us-gov)?:lambda:[a-z]{2}(?:-gov)?-[a-z]+-\d{1}:\d{12}:function:IngestFunction(?::(?:\$LATEST|[a-zA-Z0-9-_]+))?'
+  DuplicatorFunctionRoleArnParameter:
+    Description: '(Required) The ARN of the Duplicator Function Role (IAM) within the vault.'
+    Type: 'String'
+    ConstraintDescription: 'Must be a valid AWS IAM Role for the Cheyenne Duplicator Function Role.'
+    AllowedPattern: 'arn:aws(?:-us-gov)?:iam::\d{12}:role/uncomn/cheyenne/DuplicatorFunctionRole'
+  SourceBucketNameParameter:
+    Description: '(Required) The name of the source bucket to create.'
+    Type: 'String'
+    ConstraintDescription: 'Must be a valid S3 bucket name.'
+    AllowedPattern: '^(?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: 'Bucket Configuration'
+      Parameters:
+      - 'SourceBucketNameParameter'
+    - Label:
+        default: 'Vault Access Configuration'
+      Parameters:
+      - 'IngestFunctionParameter'
+      - 'DuplicatorFunctionRoleArnParameter'
+    ParameterLabels:
+      SourceBucketNameParameter:
+        default: 'Bucket Name'
+      IngestFunctionParameter:
+        default: 'Ingest Function ARN'
+      DuplicatorFunctionRoleArnParameter:
+        default: 'Duplicator Function Role ARN'
+
+Resources:
+  IngestBucketKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: 'Key used to secure source buckets.'
+      Enabled: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: 'All access to root account'
+          Effect: 'Allow'
+          Principal:
+            AWS:
+            - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+          Action:
+          - 'kms:*'
+          Resource: '*'
+        - Sid: 'Allow DuplicatorFunction within Vault to decrypt'
+          Effect: 'Allow'
+          Principal:
+            AWS:
+            - !Ref 'DuplicatorFunctionRoleArnParameter'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:DescribeKey'
+          Resource: '*'
+        # Recommendation: Add additional SIDs to allow for encrypting files/decrypting files in the ingest bucket.
+        # ex:
+        # - Sid: 'Allow decrypting files for ROLE.'
+        #   Effect: 'Allow'
+        #   Principal:
+        #     AWS:
+        #     - '' # YOUR ROLE ARN GOES HERE
+        #   Action:
+        #   - 'kms:Decrypt'
+        #   - 'kms:DescribeKey'
+        #   Resource: '*'
+      KeySpec: 'SYMMETRIC_DEFAULT'
+      KeyUsage: 'ENCRYPT_DECRYPT'
+      PendingWindowInDays: 7
+    DeletionPolicy: 'Delete'
+
+  IngestBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref 'SourceBucketNameParameter'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: 'aws:kms'
+            KMSMasterKeyID: !Sub '${IngestBucketKey.Arn}'
+          BucketKeyEnabled: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:*'
+          Function: !Ref 'IngestFunctionParameter'
+      AccessControl: 'Private'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      ### Should lifecycle management be desired, specify it here
+      # LifecycleConfiguration:
+      #   Rules:
+      #   - Id: 'SourceLifecyclePolicy'
+      #     Status: 'Enabled'
+      #     ExpirationInDays: '30'
+      #     Transitions:
+      #     - StorageClass: 'GLACIER'
+      #       TransitionInDays: '7'
+    DeletionPolicy: 'Retain'
+    DependsOn:
+    - 'IngestBucketKey'
+
+  IngestBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref 'IngestBucket'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: 'IngestPolicy'
+        Statement:
+        - Sid: 'Allow Duplicator Function Access to Bucket'
+          Effect: 'Allow'
+          Principal:
+            AWS: !Ref 'DuplicatorFunctionRoleArnParameter'
+          Action:
+          - 's3:ListBucket'
+          - 's3:GetBucketLocation'
+          - 's3:GetBucketVersioning'
+          Resource:
+          - !Sub '${IngestBucket.Arn}'
+        - Sid: 'Allow Duplicator Function Access to files'
+          Effect: 'Allow'
+          Principal:
+            AWS: !Ref 'DuplicatorFunctionRoleArnParameter'
+          Action:
+          - 's3:GetObject'
+          - 's3:GetObjectVersion'
+          - 's3:GetObjectTagging'
+          - 's3:GetObjectVersionTagging'
+          - 's3:PutObjectTagging'
+          - 's3:PutObjectVersionTagging'
+          Resource:
+          - !Sub '${IngestBucket.Arn}/*'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'IngestBucket'

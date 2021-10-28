@@ -1,0 +1,564 @@
+#
+# vault-account.yml
+#
+# Project Cheyenne
+#
+# @author Damian Bushong <dbushong@uncomn.com>
+# @copyright (c) 2021 UNCOMN LLC.
+# @license MIT License
+#
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates the Cheyenne Vault and supporting components.'
+
+Parameters:
+  VaultBucketNameParameter:
+    Description: 'The name to use for the Vault Bucket.'
+    Type: 'String'
+    ConstraintDescription: 'Must be a valid S3 bucket name.'
+    AllowedPattern: '^(?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)$'
+  VaultAgeThresholdParameter:
+    Description: '(Required) The number of days to store and protect an object (including older versions) in the Vault before deletion. Files will be automatically removed once the protection period has elapsed. PLEASE NOTE: Files CANNOT be removed from the Vault before the Object Protection Duration has elapsed.'
+    Type: 'Number'
+    Default: 365
+    MinValue: 1
+  VaultGlacierTransitionThresholdParameter:
+    Description: '(Optional) The number of days the latest version of an object should exist in the Vault before it is transitioned to Glacier storage; specify 0 to disable.'
+    Type: 'Number'
+    Default: 0
+    MinValue: 0
+  VaultOldVersionGlacierTransitionThresholdParameter:
+    Description: '(Optional) The number of days an older version of an object should exist in the Vault before it is transitioned to Glacier storage; specify 0 to disable.'
+    Type: 'Number'
+    Default: 0
+    MinValue: 0
+  IngestReservedConcurrencyParameter:
+    Description: 'The reserved concurrency for the Ingest function.'
+    Type: 'Number'
+    Default: 50
+    MinValue: 0
+  DuplicatorReservedConcurrencyParameter:
+    Description: 'The reserved concurrency for the Duplicator function.'
+    Type: 'Number'
+    Default: 50
+    MinValue: 0
+  DuplicatorParallelProcessingParameter:
+    Description: 'The maximum parallel invocations we will use for the Duplicator function.'
+    Type: 'Number'
+    Default: 20
+    MinValue: 5
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: 'Vault Name'
+      Parameters:
+      - 'VaultBucketNameParameter'
+    - Label:
+        default: 'Vault Lifecycle Configuration'
+      Parameters:
+      - 'VaultAgeThresholdParameter'
+      - 'VaultGlacierTransitionThresholdParameter'
+      - 'VaultOldVersionGlacierTransitionThresholdParameter'
+    - Label:
+        default: 'Vault Function Performance Tuning'
+      Parameters:
+      - 'IngestReservedConcurrencyParameter'
+      - 'DuplicatorReservedConcurrencyParameter'
+      - 'DuplicatorParallelProcessingParameter'
+    ParameterLabels:
+      VaultBucketNameParameter:
+        default: 'Vault Bucket Name'
+      VaultAgeThresholdParameter:
+        default: 'Object Protection Duration'
+      VaultGlacierTransitionThresholdParameter:
+        default: 'Glacier Transition Age Threshold'
+      VaultOldVersionGlacierTransitionThresholdParameter:
+        default: 'Glacier Transition Age Threshold (Older Object Versions)'
+      IngestReservedConcurrencyParameter:
+        default: 'Ingest Function Reserved Concurrency'
+      DuplicatorReservedConcurrencyParameter:
+        default: 'Duplicator Function Reserved Concurrency'
+      DuplicatorParallelProcessingParameter:
+        default: 'Duplicator Parallel Processing Factor'
+
+Conditions:
+  HasVaultGlacierTransition: !Not
+  - !Equals [!Ref 'VaultGlacierTransitionThresholdParameter', 0]
+  HasVaultOldVersionGlacierTransition: !Not
+  - !Equals [!Ref 'VaultOldVersionGlacierTransitionThresholdParameter', 0]
+
+Resources:
+  VaultKMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: 'Key used to store files in the Vault.'
+      Enabled: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: 'Provide full access to root account'
+          Effect: 'Allow'
+          Principal:
+            AWS:
+            - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+          Action:
+          - 'kms:*'
+          Resource: '*'
+        - Sid: 'Allow encrypting files by DuplicatorFunction.'
+          Effect: 'Allow'
+          Principal:
+            AWS:
+            - !Sub '${DuplicatorFunctionRole.Arn}'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:Encrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:DescribeKey'
+          Resource: '*'
+        # Recommendation: Add additional sids to allow for decrypting the files in the bucket.
+        # ex:
+        # - Sid: 'Allow decrypting files for ROLE.'
+        #   Effect: 'Allow'
+        #   Principal:
+        #     AWS:
+        #     - '' # YOUR ROLE ARN GOES HERE
+        #   Action:
+        #   - 'kms:Decrypt'
+        #   - 'kms:DescribeKey'
+        #   Resource: '*'
+      KeySpec: 'SYMMETRIC_DEFAULT'
+      KeyUsage: 'ENCRYPT_DECRYPT'
+      PendingWindowInDays: 7
+    DeletionPolicy: 'Retain'
+    DependsOn:
+    - 'DuplicatorFunctionRole'
+
+  VaultKMSKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: 'alias/CheyenneVaultKMSKey'
+      TargetKeyId: !Ref 'VaultKMSKey'
+    DeletionPolicy: 'Retain'
+    DependsOn:
+    - 'VaultKMSKey'
+
+  VaultBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref 'VaultBucketNameParameter'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: 'aws:kms'
+            KMSMasterKeyID: !Sub '${VaultKMSKey.Arn}'
+          BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: 'Enabled'
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: 'Enabled'
+        Rule:
+          DefaultRetention:
+            Mode: 'COMPLIANCE'
+            Days: !Ref 'VaultAgeThresholdParameter'
+      LifecycleConfiguration:
+        Rules:
+        - Id: 'MultipartPolicy'
+          Status: 'Enabled'
+          AbortIncompleteMultipartUpload:
+            DaysAfterInitiation: 14
+        - Id: 'VaultExpirationPolicy'
+          Status: 'Enabled'
+          ExpirationInDays: !Ref 'VaultAgeThresholdParameter'
+          NoncurrentVersionExpirationInDays: !Ref 'VaultAgeThresholdParameter'
+        - Id: 'VaultAutoGlacierPolicy'
+          Status: !If
+          - 'HasVaultGlacierTransition'
+          - 'Enabled'
+          - 'Disabled'
+          Transitions:
+          - StorageClass: 'GLACIER'
+            TransitionInDays: !Ref 'VaultGlacierTransitionThresholdParameter'
+        - Id: 'VaultOldVersionAutoGlacierPolicy'
+          Status: !If
+          - 'HasVaultOldVersionGlacierTransition'
+          - 'Enabled'
+          - 'Disabled'
+          NoncurrentVersionTransitions:
+          - StorageClass: 'GLACIER'
+            TransitionInDays: !Ref 'VaultOldVersionGlacierTransitionThresholdParameter'
+    DeletionPolicy: 'Retain'
+
+  VaultBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref 'VaultBucket'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: 'VaultBucketPolicy'
+        Statement:
+        - Sid: 'Allow Duplicator Function Access to Bucket'
+          Effect: 'Allow'
+          Principal:
+            AWS: !Sub '${DuplicatorFunctionRole.Arn}'
+          Action:
+          - 's3:ListBucket'
+          Resource:
+          - !Sub '${VaultBucket.Arn}'
+        - Sid: 'Allow Duplicator Function Access to files'
+          Effect: 'Allow'
+          Principal:
+            AWS: !Sub '${DuplicatorFunctionRole.Arn}'
+          Action:
+          - 's3:PutObject'
+          Resource:
+          - !Sub '${VaultBucket.Arn}/*'
+    DeletionPolicy: 'Retain'
+    DependsOn:
+    - 'VaultBucket'
+    - 'DuplicatorFunctionRole'
+
+  BadReceiveQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'uncomn-cheyenne-failed_ingest'
+      MessageRetentionPeriod: 604800
+    DeletionPolicy: 'Delete'
+
+  DeadDuplicatorQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'uncomn-cheyenne-failed_duplication.fifo'
+      FifoQueue: true
+      MessageRetentionPeriod: 604800
+    DeletionPolicy: 'Delete'
+
+  DuplicatorQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'uncomn-cheyenne-duplicator_main.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      RedrivePolicy:
+        deadLetterTargetArn: !Sub '${DeadDuplicatorQueue.Arn}'
+        maxReceiveCount: 5
+      VisibilityTimeout: 180 # 3mins
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'DeadDuplicatorQueue'
+
+  DuplicatorLargeQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'uncomn-cheyenne-duplicator_large.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      RedrivePolicy:
+        deadLetterTargetArn: !Sub '${DeadDuplicatorQueue.Arn}'
+        maxReceiveCount: 5
+      VisibilityTimeout: 300 # 5mins
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'DeadDuplicatorQueue'
+
+  Boto3LambdaLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      LayerName: 'uncomn-cheyenne-boto3'
+      Description: 'boto3 Lambda Layer'
+      CompatibleRuntimes:
+      - 'python3.8'
+      Content:
+        S3Bucket: !ImportValue 'AccountStagingBucketName'
+        S3Key: !Sub
+        - 'boto3-layer_python3.8_${AssetVersion}.zip'
+        - AssetVersion: !ImportValue 'Boto3LayerVersion'
+      LicenseInfo: 'Apache-2.0'
+    DeletionPolicy: 'Delete'
+
+  PythonJSONLoggerLambdaLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      LayerName: 'uncomn-cheyenne-python-json-logger'
+      Description: 'python-json-logger Lambda Layer'
+      CompatibleRuntimes:
+      - 'python3.8'
+      Content:
+        S3Bucket: !ImportValue 'AccountStagingBucketName'
+        S3Key: !Sub
+        - 'python-json-logger-layer_python3.8_${AssetVersion}.zip'
+        - AssetVersion: !ImportValue 'PythonJSONLoggerLayerVersion'
+      LicenseInfo: 'BSD-2-Clause'
+    DeletionPolicy: 'Delete'
+
+  IngestFunctionPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: 'IngestFunctionPolicy'
+      Path: '/uncomn/cheyenne/'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Action:
+          - 'sqs:SendMessage'
+          - 'sqs:SendMessageBatch'
+          Resource: !Sub '${BadReceiveQueue.Arn}'
+        - Effect: 'Allow'
+          Action:
+          - 'sqs:SendMessage'
+          - 'sqs:SendMessageBatch'
+          Resource: !Sub '${DuplicatorQueue.Arn}'
+        - Effect: 'Allow'
+          Action:
+          - 'sqs:SendMessage'
+          - 'sqs:SendMessageBatch'
+          Resource: !Sub '${DuplicatorLargeQueue.Arn}'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'BadReceiveQueue'
+    - 'DuplicatorQueue'
+    - 'DuplicatorLargeQueue'
+
+  DuplicatorFunctionPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: 'DuplicatorFunctionPolicy'
+      Path: '/uncomn/cheyenne/'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Action:
+          - 's3:ListBucket'
+          Resource:
+          - !Sub 'arn:${AWS::Partition}:s3:::${VaultBucketNameParameter}'
+        - Effect: 'Allow'
+          Action:
+          - 's3:PutObject'
+          - 's3:GetObjectTagging'
+          - 's3:GetObjectVersionTagging'
+          - 's3:PutObjectTagging'
+          - 's3:PutObjectVersionTagging'
+          Resource:
+          - !Sub 'arn:${AWS::Partition}:s3:::${VaultBucketNameParameter}/*'
+        # in order to avoid circular dependencies, we have to basically grant the duplicator function access
+        #   to using all KMS keys.  We will have to depend on key policies to enforce access only in this case.
+        - Effect: 'Allow'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:Encrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:DescribeKey'
+          Resource:
+          - !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+        # we need to be able to "accept" things from the queues
+        - Effect: 'Allow'
+          Action:
+          - 'sqs:SendMessage'
+          - 'sqs:SendMessageBatch'
+          Resource: !Sub '${DuplicatorQueue.Arn}'
+        - Effect: 'Allow'
+          Action:
+          - 'sqs:SendMessage'
+          - 'sqs:SendMessageBatch'
+          Resource: !Sub '${DuplicatorLargeQueue.Arn}'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'DuplicatorQueue'
+    - 'DuplicatorLargeQueue'
+
+  DuplicatorSourcePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: 'DuplicatorSourcePolicy'
+      Path: '/uncomn/cheyenne/'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        #
+        # note: due to project constraints, we cannot narrowly specify the list of buckets that
+        #   the Duplicator can read from.  if you use a well-structured pattern for source buckets,
+        #   we HIGHLY recommend you bake that into this Policy to better constrain the Duplicator.
+        #
+        # also of note: the Duplicator being misled into arbitrarily reading from buckets other than
+        #   configured source buckets via false requests to the ingest function is mitigated by use of
+        #   AWS::Lambda::Permission resources - these which are defined by using the grant-source-invoke.yml
+        #   template, and are REQUIRED by AWS to allow for S3 events to invoke Lambda functions located in
+        #   a different account.
+        #
+        - Effect: 'Allow'
+          Action:
+          - 's3:ListBucket'
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+          # Resource: !Sub 'arn:${AWS::Partition}:s3:::my-bucket-naming-standard-*'
+        - Effect: 'Allow'
+          Action:
+          - 's3:GetObject'
+          - 's3:GetObjectTagging'
+          - 's3:PutObjectTagging'
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
+          # Resource: !Sub 'arn:${AWS::Partition}:s3:::my-bucket-naming-standard-*/*'
+        - Effect: 'Allow'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:DescribeKey'
+          Resource:
+          - !Sub 'arn:${AWS::Partition}:kms:*:*:key/*'
+    DeletionPolicy: 'Delete'
+
+  IngestFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'IngestFunctionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: 'Allow'
+          Principal:
+            Service:
+            - !Sub 'lambda.${AWS::URLSuffix}'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/uncomn/cheyenne/'
+      ManagedPolicyArns:
+      - !Ref 'IngestFunctionPolicy'
+      # note: use VPCs or need to comply with VPC-attached Lambda mandates?
+      #   comment this out and use the AWSLambdaVPCAccessExecutionRole below instead.
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      # - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'IngestFunctionPolicy'
+
+  DuplicatorFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'DuplicatorFunctionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: 'Allow'
+          Principal:
+            Service:
+            - !Sub 'lambda.${AWS::URLSuffix}'
+          Action:
+            - 'sts:AssumeRole'
+      Path: '/uncomn/cheyenne/'
+      ManagedPolicyArns:
+      - !Ref 'DuplicatorFunctionPolicy'
+      - !Ref 'DuplicatorSourcePolicy'
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+      # note: use VPCs or need to comply with VPC-attached Lambda mandates?
+      #   comment this out and use the AWSLambdaVPCAccessExecutionRole below instead.
+      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      # - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'DuplicatorFunctionPolicy'
+    - 'DuplicatorSourcePolicy'
+
+  IngestFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'IngestFunction'
+      Handler: 'ingest.lambda_handler'
+      Environment:
+        Variables:
+          MAX_DUPLICATOR_CONCURRENCY: !Ref 'DuplicatorParallelProcessingParameter'
+          BAD_RECEIVE_QUEUE: !Ref 'BadReceiveQueue'
+          DUPLICATOR_QUEUE: !Ref 'DuplicatorQueue'
+          DUPLICATOR_LARGE_QUEUE: !Ref 'DuplicatorLargeQueue'
+      Layers:
+      - !Ref 'Boto3LambdaLayer'
+      - !Ref 'PythonJSONLoggerLambdaLayer'
+      Role: !Sub '${IngestFunctionRole.Arn}'
+      Runtime: 'python3.8'
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        S3Bucket: !ImportValue 'AccountStagingBucketName'
+        S3Key: !Sub
+        - 'ingest-function_${AssetVersion}.zip'
+        - AssetVersion: !ImportValue 'IngestFunctionVersion'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'Boto3LambdaLayer'
+    - 'PythonJSONLoggerLambdaLayer'
+    - 'IngestFunctionRole'
+
+  DuplicatorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'DuplicatorFunction'
+      Handler: 'duplicator.lambda_handler'
+      Environment:
+        Variables:
+          VAULT_BUCKET: !Ref 'VaultBucketNameParameter'
+      Layers:
+      - !Ref 'Boto3LambdaLayer'
+      - !Ref 'PythonJSONLoggerLambdaLayer'
+      Role: !Sub '${DuplicatorFunctionRole.Arn}'
+      Runtime: 'python3.8'
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: !Ref 'DuplicatorReservedConcurrencyParameter'
+      Code:
+        S3Bucket: !ImportValue 'AccountStagingBucketName'
+        S3Key: !Sub
+        - 'duplicator-function_${AssetVersion}.zip'
+        - AssetVersion: !ImportValue 'DuplicatorFunctionVersion'
+    DeletionPolicy: 'Delete'
+    DependsOn:
+    - 'Boto3LambdaLayer'
+    - 'PythonJSONLoggerLambdaLayer'
+    - 'DuplicatorFunctionRole'
+
+  DuplicatorEventSourceMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      EventSourceArn: !Sub '${DuplicatorQueue.Arn}'
+      FunctionName: !Ref 'DuplicatorFunction'
+      BatchSize: 10
+      Enabled: true
+    DependsOn:
+    - 'DuplicatorFunction'
+    - 'DuplicatorQueue'
+
+  DuplicatorLargeEventSourceMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      EventSourceArn: !Sub '${DuplicatorLargeQueue.Arn}'
+      FunctionName: !Ref 'DuplicatorFunction'
+      BatchSize: 1
+      Enabled: true
+    DependsOn:
+    - 'DuplicatorFunction'
+    - 'DuplicatorLargeQueue'
+
+Outputs:
+  VaultBucketName:
+    Description: 'The name of the bucket in use for vault storage.'
+    Value: !Ref 'VaultBucket'
+    Export:
+      Name: 'VaultBucketName'
+  IngestFunctionArn:
+    Description: 'The ARN of the Ingest Function.'
+    Value: !Sub '${IngestFunction.Arn}'
+    Export:
+      Name: 'IngestFunctionArn'
+  DuplicatorFunctionRoleArn:
+    Description: 'The ARN of the Duplicator Function Role.'
+    Value: !Sub '${DuplicatorFunctionRole.Arn}'
+    Export:
+      Name: 'DuplicatorFunctionRoleArn'

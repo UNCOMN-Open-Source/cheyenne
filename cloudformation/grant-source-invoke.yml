@@ -1,0 +1,49 @@
+#
+# grant-source-invoke.yml
+#
+# Project Cheyenne
+#
+# @author Damian Bushong <dbushong@uncomn.com>
+# @copyright (c) 2021 UNCOMN LLC.
+# @license MIT License
+#
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Grants access to an external source bucket, permitting invocation of the Ingest Function to allow Vault processing.'
+
+Parameters:
+  SourceAccountIdParameter:
+    Description: 'The Account ID to allow ingest into the Vault from.'
+    Type: 'String'
+    ConstraintDescription: 'Must be a valid AWS Account ID.'
+    AllowedPattern: '^\d{12}$'
+  SourceBucketNameParameter:
+    Description: 'The name of the source bucket allow ingest into the Vault from.  Should belong to the Account ID specified by SourceAccountIdParameter.'
+    Type: 'String'
+    ConstraintDescription: 'Must be a valid S3 bucket name.'
+    AllowedPattern: '^(?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: 'Source Configuration'
+      Parameters:
+      - 'SourceAccountIdParameter'
+      - 'SourceBucketNameParameter'
+    ParameterLabels:
+      SourceAccountIdParameter:
+        default: 'Source Account ID'
+      SourceBucketNameParameter:
+        default: 'Source Bucket Name'
+
+Resources:
+  IngestFunctionPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !ImportValue 'IngestFunctionArn'
+      Action: 'lambda:InvokeFunction'
+      Principal: !Sub 's3.${AWS::URLSuffix}'
+      SourceAccount: !Ref 'SourceAccountIdParameter'
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${SourceBucketNameParameter}'
+    DeletionPolicy: 'Delete'

@@ -1,0 +1,59 @@
+#
+# vault-init.yml
+#
+# Project Cheyenne
+#
+# @author Damian Bushong <dbushong@uncomn.com>
+# @copyright (c) 2021 UNCOMN LLC.
+# @license MIT License
+#
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Prepares an account to be used as a Cheyenne Vault.'
+
+Resources:
+  AccountStagingBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: 'AES256'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: 'Retain'
+
+Outputs:
+  AccountStagingBucketName:
+    Description: 'The name of the bucket used to stage lambda layers, lambda code, etc.'
+    Value: !Ref 'AccountStagingBucket'
+    Export:
+      Name: 'AccountStagingBucketName'
+  #
+  # DO NOT MODIFY THESE VALUES.
+  # Values for exports should be blank unless this file is within a distribution package
+  #   The pipeline will modify the template to insert the correct version strings.
+  #
+  Boto3LayerVersion:
+    Description: 'The version of the boto3 Lambda layer to use.'
+    Value: '' # layer-boto3.version
+    Export:
+      Name: 'Boto3LayerVersion'
+  PythonJSONLoggerLayerVersion:
+    Description: 'The version of the python-json-logger Lambda layer to use.'
+    Value: '' # layer-python-json-logger.version
+    Export:
+      Name: 'PythonJSONLoggerLayerVersion'
+  DuplicatorFunctionVersion:
+    Description: 'The version of the duplicator function to use.'
+    Value: '' # function-duplicator.version
+    Export:
+      Name: 'DuplicatorFunctionVersion'
+  IngestFunctionVersion:
+    Description: 'The version of the ingest function to use.'
+    Value: '' # function-ingest.version
+    Export:
+      Name: 'IngestFunctionVersion'
